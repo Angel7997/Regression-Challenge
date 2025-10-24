@@ -1,0 +1,1043 @@
+---
+title: "MLAI 2025 Regression Challenge"
+output: html_document
+---s
+---
+
+# Project: MLAI 2025 Regression Challenge
+
+**Team Members**: Gabriel Witte, Nataliia Korobkova, Muhammad Saim, Areeb **Description**: Here we present a detailed ML pipeline following the CRISP-DM standard for the AirBnB dataset.
+
+## Step 0. Imports and dependencies
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(tidymodels)
+library(stringr)
+library(lubridate)
+library(janitor)
+library(tidytext)
+library(stopwords)
+library(scales)
+library(corrplot)
+library(dplyr)
+library(xgboost)
+library(Matrix)
+library(yardstick)
+library(stringr)
+library(stringi)
+library(vip)
+
+set.seed(42) # we set a deterministic seed to output the same results no matter how we train the model
+
+# we use this to remove outliers later. 
+remove_outliers_iqr <- function(x) {
+  if (!is.numeric(x)) stop("Input must be numeric")
+
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_value <- IQR(x, na.rm = TRUE)
+
+  lower_bound <- Q1 - 1.5 * IQR_value
+  upper_bound <- Q3 + 1.5 * IQR_value
+
+  x >= lower_bound & x <= upper_bound
+}
+
+make_perf_table <- function(res, wf, train_df, truth, metric_name = "rmse") {
+
+  val_raw <- collect_metrics(res) %>% dplyr::filter(.metric == metric_name)
+
+  # Identify parameter vs meta columns
+  meta_candidates <- c(".metric", ".estimator", "mean", "std_err",
+                       ".config", ".iter", ".sample", "n", ".n")
+  meta_cols  <- intersect(meta_candidates, names(val_raw))
+  param_cols <- setdiff(names(val_raw), meta_cols)
+
+  # Figure out which name is used for resample count
+  n_resample_col <- dplyr::case_when(
+    "n"  %in% names(val_raw) ~ "n",
+    ".n" %in% names(val_raw) ~ ".n",
+    TRUE ~ NA_character_
+  )
+
+  val_tbl <- val_raw %>%
+    dplyr::transmute(
+      !!!rlang::syms(param_cols),
+      rmse_val = mean,
+      se_val   = std_err,
+      n_resamples = if (!is.na(n_resample_col)) .data[[n_resample_col]] else NA_integer_
+    )
+
+  # Fit on training data for each param row
+  params_unique <- dplyr::distinct(val_tbl, !!!rlang::syms(param_cols))
+
+  train_tbl <- purrr::pmap_dfr(params_unique, function(...) {
+    par_row <- tibble::tibble(...)
+    wf_i    <- tune::finalize_workflow(wf, par_row)
+    fit_i   <- parsnip::fit(wf_i, data = train_df)
+    preds   <- predict(fit_i, new_data = train_df)[[".pred"]]
+
+    tibble::as_tibble(par_row) %>%
+      dplyr::mutate(
+        rmse_train = yardstick::rmse_vec(truth = train_df[[truth]], estimate = preds)
+      )
+  })
+
+  val_tbl %>%
+    dplyr::left_join(train_tbl, by = param_cols) %>%
+    dplyr::mutate(gap = rmse_val - rmse_train) %>%
+    dplyr::arrange(rmse_val)
+}
+
+
+```
+
+## Step: 1. Data Understanding
+
+In this section we'll get a feel for the current variables we will work with.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_train = read.csv("data/train.csv")
+
+df_train %>%
+  summarise(
+    mean_price   = mean(price),
+    median_price = median(price),
+    sd_price     = sd(price),
+    min_price    = min(price),
+    max_price    = max(price)
+  )
+
+df_train %>%
+  glimpse() %>%
+  head(10)
+
+# In general we see the the following data:
+
+# Variable: ID
+# Data type: int
+# Variable type: Numerical/Quantitative -> Discrete
+# Description: Simple identifier for the rows.
+# Useful for analysis: False, as it is mainly an identifier
+# values: range(0, inf)
+
+# Variable: name
+# Data type: chr
+# Variable type: Categorical/Qualitative -> Nominal
+# Description: The name of the place being offered at AirBnB
+# Useful for inference: False, as it's mainly an identifier
+# values: any 
+
+# Variable: host_id
+# Data type: int
+# Variable type: Numerical/Quantitative -> Discrete
+# Description: Simple identifier - Won't be useful for the data analysis
+# Useful for inference: False, as it's mainly an identifier
+# values: range(0, inf)
+
+# Variable: host_name
+# Data type: chr
+# Variable type: Categorical/Qualitative -> Nominal
+# Description: The name of the host/franchise offering the place.
+# Useful for inference: False, some names would be interesting to analyze, e.g companies such as ComfortInn, Ibis, etc. However AirBnB allows for people to host their hotels, meaning that names such as Rebecca may refer to multiple people, not just one.
+# values: any
+
+# Variable: neighbourhood
+# Data type: chr
+# Variable type: Categorical/Qualitative -> Nominal
+# Description: The location in which the offering is based
+# Useful for inference: Possible, have to check (will have to encode if so).
+# values: shown below
+unique(df_train$neighbourhood)
+
+# Variable: latitude
+# Data type: dbl
+# Variable type: Numerical/Quantitative -> Continuous
+# Description: The location in coordinates of the offering in the x-axis.
+# Useful for inference: Possible, have to check.
+# values: range(-180, 180)
+
+# Variable: longitude
+# Data type: dbl
+# Variable type: Numerical/Quantitative -> Continuous
+# Description: The location in coordinates of the offering in the y-axis.
+# Useful for inference: Possible, have to check.
+# values: range(-180, 180)
+
+# Variable: room_type
+# Data type: chr
+# Variable type: Categorical/Qualitative -> Nominal
+# Description: The type of room types that the offering provides.
+# Useful for inference: Possible, have to check (will have to encode if so).
+# values: shown below
+unique(df_train$room_type)
+
+# Variable: price
+# Data type: dbl
+# Variable type: Numerical/Quantitative -> Continuous
+# Description: The price for the offering.
+# Useful for inference: This is the TARGET.
+# values: range(0, inf)
+
+# Variable: minimum_nights
+# Data type: int
+# Variable type: Numerical/Quantitative -> Discrete
+# Description: The minimum amount of nights a user must select in order to book the offering.
+# Useful for inference: Possible, have to check.
+# values: range(0, inf)
+
+# Variable: number_of_reviews
+# Data type: int
+# Variable type: Numerical/Quantitative -> Discrete
+# Description: The amount of reviews currently for the offer.
+# Useful for inference: Possible, have to check.
+# values: range(0, inf)
+
+# Variable: last_review
+# Data type: chr
+# Variable type: Categorial/Qualitative -> Ordinal
+# Description: The date of the last review.
+# Useful for inference: Possible, have to check (will have to encode).
+# values: anything in the format YYYY-MM-DD
+
+# Variable: reviews_per_month
+# Data type: dbl
+# Variable type: Nominal/Quantitative -> Continuous
+# Description: The amount of reviews the offering gets per month (likely average)
+# Useful for inference: Possible, have to check.
+# values: range(0.0 , inf)
+
+# Variable: calculated_host_listings_count 
+# Data type: int
+# Variable type: Nominal/Quantitative -> Discrete
+# Description: The amount of listings the host offers.
+# Useful for inference: Possible, have to check.
+# values: range(0, inf)
+
+
+# Variable: availability_365
+# Data type: int
+# Variable type: Nominal/Quantitative -> Discrete
+# Description: How many days a year the offering is available for booking
+# Useful for inference: Possible, have to check.
+# values: range(0, inf)
+```
+
+### 1.1 - Dropping redundant rows + setting correct data type
+
+Based on the previous step, we found out that `ID`, `name`, `host_id`, and `host_name` are all just identifiers -\> therefore we simply remove them from out dataset. Also since `last_review` is a datetime, we change it to the date format:
+
+however, we can still extract some keywords from `name` in order to maybe get more important information, so we keep it for now
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_train <- df_train %>% 
+  select(
+    -ID, # dropping ID
+    -host_id, # host_id 
+    -host_name # host_name
+  ) %>%
+  mutate(
+    last_review = ymd(last_review),
+    neighbourhood = as.factor(neighbourhood)
+  )
+
+```
+
+### 1.2 - Detecting Logical Inconsistencies and Impossible Values
+
+Also based on the previous step, we can proceed to to check for illogical inconsistencies in the variables and between similar variables
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+# the script checks our flag conditions and there outputs the columns which violate at least one of the conditions + outputs only columns where at least one record has violated it
+
+df_issues <- df_train %>%
+  mutate(
+    flag_latitude = latitude < -90 | latitude > 90, #checking the longitude and latitude 
+    flag_longitude = longitude < -180 | longitude > 180,
+    flag_price = price <= 0, # price should be a positive number + a price of 0 is pretty sus
+    flag_min_nights = minimum_nights < 1, # minimum nights also should be at least 1
+    flag_availability = availability_365 < 0 | availability_365 > 365, # the bookable days in a year must not be negative and not more than 365 days 
+    flag_host_listings = calculated_host_listings_count < 1, # a host must have at least one listing
+    flag_reviews_neg = number_of_reviews < 0, #number of reviews cannot be negative
+    flag_reviews_per_month_neg = reviews_per_month < 0, # same for reviews
+    flag_review_logic = (number_of_reviews == 0 & reviews_per_month > 0), #if there are no reviews, reviews per month must be 0 (or N/A)
+    flag_last_review_future = ymd(last_review) > Sys.Date(), #last review date cant be in the future
+    flag_infinite = if_any(where(is.numeric), is.infinite) # here we just check whether there are infinite values
+  ) %>%
+  # here we check if at least one flag is true
+  filter(if_any(starts_with("flag_"), ~ .x %in% TRUE)) %>%
+  # here we get the columns that have been violated 
+  {
+    flag_cols <- grep("^flag_", names(.), value = TRUE)
+    flags_to_keep <- names(
+      select(., all_of(flag_cols)) %>%
+        select(where(~ any(.x, na.rm = TRUE)))
+    )
+    non_flag_cols <- setdiff(names(.), flag_cols)
+    select(., all_of(flags_to_keep), all_of(non_flag_cols))
+  }
+
+df_issues
+
+
+```
+
+the rows luckily do not violate any of the conditions, hence we can expect that most of the dataset is integrous (as in integrity)
+
+### 1.3 - Dealing with missing values
+
+now we deal with the missing values
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+# to prettify, we print the missing count and percentage inside the table
+missing_table <- data.frame(
+  column = names(df_train),
+  missing_count = sapply(df_train, function(x) sum(is.na(x))),
+  missing_percent = sapply(df_train, function(x) mean(is.na(x)) * 100)
+)
+
+# we filter out the columns without any missing values and sort it in descending order
+missing_table %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_count))
+
+
+```
+
+we see that `reviews_per_month` columns has 475 missing values - we try to examin it to see how we proceed (and check if N/A just means 0)
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_train %>%
+  filter(reviews_per_month == 0 | is.na(reviews_per_month))
+```
+
+we see that all rows that have N/A for `reviews_per_month` have `number_of_reviews` = 0 so we set `reviews_per_month` to zero
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_train <- df_train %>%
+  mutate(
+    reviews_per_month = replace_na(reviews_per_month, 0), 
+  )
+
+```
+
+### 1.4 - Transforming values
+
+#### 1.4.1 - Creating ratios
+
+basic and even advanced models such as neural networks and XGBoost have a hard time calculating ratios. hence in order to try to scale the variables as well as give them a ratio, we will turn
+
+-   `availability_365_rate`: a percentage metric for the expected availability in a year `availability_365_rate` \<- (365-`availability_365`)/365
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_train <- df_train %>%
+  mutate(availability_365_rate=(365-availability_365)/365) %>%
+  select(-availability_365)
+```
+
+-   we also do one-hot encoding of room_type, as it is less than 17 unique values.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+room_dummies <- model.matrix(~ room_type - 1, data = df_train) %>%
+  as.data.frame()
+
+# Bind the new dummy columns and remove the original column
+df_train <- bind_cols(
+  df_train %>% select(-room_type),
+  room_dummies
+)
+
+```
+
+#### 1.4.2 - Text-mining! :D
+
+although the name serves as more of an identifier, it still contains a lot of adjectives describing the text, e.g here: Elegant vintage apartment in Ravenswood or phrases like this, which certainly don't make me feel so good about it: Disinfected, Sunny, Safe, top floor Condo w/ view. hence we could create columns counting the amount of words representing luxury terms, positive terms, and terms that are sketchy or show that is cheap
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+luxury_terms <- c(
+  "luxury", "luxurious", "luxe", "penthouse", "chic", "elegant", 
+  "opulent", "upscale", "high-end", "premium", "exclusive", "boutique", 
+  "designer", "plush", "deluxe", "posh", "glamorous", "refined",
+  "sophisticated", "loft", "mansion", "oasis", "stunning", "gorgeous", 
+  "swanky", "spa", "suite", "modern", "sleek", "stylish", "iconic", 
+  "duplex", "villa", "estate", "suite",
+  "elite", "first-class", "grand", "gold", "coast,", "sanctuary", "haven", "oasis", "getaway", "hideaway", "king"
+)
+
+positive_terms <- c(
+  "stunning","magnificent","spacious","great","cozy","beautiful","gorgeous", "dreamy",
+  "amazing","lovely","bright","modern","sleek","stylish","sunny",
+  "quiet","comfortable","renovated","brand[- ]new","updated","charming", "new"
+)
+
+sketchy_terms <- c(
+  "safe", "clean", "sanitized",
+  "tiny", "quirky", "basement", "subterranean", 
+  "lower level", "garden unit", "pad", "nook", "crash pad", 
+  "hostel", "price drop", "great deal", "bargain", "deal",
+  "frugal", "cheap", "budget", "value",
+  "unique", "artsy", "shared", "sofa", "couch", "futon", "loft"
+)
+
+
+# here we build a regex function to get all the terms from the list 
+rx_or <- function(terms) paste0("(?i)\\b(", paste(terms, collapse="|"), ")\\b")
+
+rx_luxury       <- rx_or(luxury_terms)
+rx_positive     <- rx_or(positive_terms)
+rx_sketchy  <- rx_or(sketchy_terms)
+
+# # here we create a function to clean the name so that it's all lozercase, removing accents and also white spaces
+normalize_name <- function(x) {
+  x %>%
+    str_trim() %>%
+    str_squish() %>%
+    str_to_lower()
+}
+
+# -- 4) Engineer features from `name` -----------------------------------------
+df_train <- df_train %>%
+  mutate(
+    name_norm       = normalize_name(name),
+    name_word_count = if_else(!is.na(name_norm) & name_norm != "",
+                              str_count(name_norm, "\\S+"), 0L),
+    name_special_char_rate = if_else(str_length(name) > 0,
+                                     str_count(name, "[^\\p{L}\\p{N} .&]") / str_length(name),
+                                     0),
+
+    name_luxury_rate   = if_else(name_word_count > 0,
+                                 str_count(name_norm, rx_luxury)   / name_word_count, 0),
+
+    name_positive_rate = if_else(name_word_count > 0,
+                                 str_count(name_norm, rx_positive) / name_word_count, 0),
+
+    name_sketchy_rate  = if_else(name_word_count > 0,
+                                 str_count(name_norm, rx_sketchy)  / name_word_count, 0),
+
+    name_upper_word_rate = if_else(name_word_count > 0,
+                                   str_count(name, "\\b\\p{Lu}+(?:'\\p{Lu}+)*\\b") / name_word_count, 0)
+  ) %>%
+  select(-name_norm, -name) # removing the redundant columns now
+
+```
+
+#### 1.4.3 - Log transformation
+
+We check for right-skewed patterns in the numeric data, in order to make them more linear through log function.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+numeric_cols <- names(df_train)[sapply(df_train, is.numeric)]
+
+numeric_plots <- lapply(numeric_cols, function(col) {
+  ggplot(df_train, aes(x = .data[[col]])) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+    geom_density(color = "red", size = 1) +
+    labs(title = paste("Distribution of", col), x = col, y = "Density") +
+    theme_minimal()
+})
+
+
+for (p in numeric_plots) {
+  print(p)
+}
+
+```
+
+We see that the columns `number_of_reviews`, `reviews_per_month`, `calculated_host_listings_count` present a strong right skewed data, while the text mining rate columns present also a similar pattern. hence we pass the log function through them. `price` also presents the same, but it is the target variable so we leave it be
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_train <- df_train %>%
+  mutate(
+    number_of_reviews = log1p(number_of_reviews),
+    reviews_per_month = log1p(reviews_per_month),
+    calculated_host_listings_count = log1p(calculated_host_listings_count),
+    name_special_char_rate = log1p(name_special_char_rate),
+    name_luxury_rate = log1p(name_luxury_rate),
+    name_positive_rate = log1p(name_positive_rate),
+    name_sketchy_rate = log1p(name_sketchy_rate),
+    name_upper_word_rate = log1p(name_upper_word_rate),
+  )
+
+```
+
+#### 1.4.4 - Outlier Removal
+
+Now we remove outliers for the numeric columns which can technically have an infinite range (so pretty much anything aside from latitude, longitude, and rates)
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_train <- df_train %>%
+  filter(
+    remove_outliers_iqr(minimum_nights),
+    remove_outliers_iqr(number_of_reviews),
+    remove_outliers_iqr(reviews_per_month),
+    remove_outliers_iqr(calculated_host_listings_count),
+    remove_outliers_iqr(name_word_count),
+    remove_outliers_iqr(price)
+  )
+
+df_train
+
+```
+
+## Step 2. Data Analysis
+
+### 2.1 Correlation Analysis
+
+#### 2.1.1 Numerical Columns
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_train$last_review <- as.numeric(as.Date(df_train$last_review)) # we get the numeric value of last_review for the correlation analysis
+
+numeric_cols <- names(df_train)[sapply(df_train, is.numeric)]
+
+# vreate correlation matrix
+cor_matrix <- cor(df_train[, numeric_cols], use = "complete.obs", method = "spearman")
+
+corrplot(cor_matrix,
+         method = "color",
+         type = "upper",
+         addCoef.col = "black",
+         tl.col = "black",
+         tl.srt = 45,
+         number.cex = 0.45,   # the plot is too dense, so we're reducing the size of the texts
+         tl.cex = 0.6
+  )
+
+# to make it more clear, we plot the correlations here for price in descending order 
+
+cor_with_price <- sort(cor_matrix[ , "price"], decreasing = TRUE)
+
+cor_table <- data.frame(
+  variable = names(cor_with_price),
+  spearman_correlation = cor_with_price,
+  row.names = NULL
+)
+
+cor_table
+```
+
+The strongest positive correlation with price is room_type = Entire home/apt (+0.54), meaning full units are significantly more expensive. Luxury wording in the name (+0.20), minimum_nights (+0.18), and longitude (+0.17) show small positive effects, suggesting upscale wording, longer stays, or certain locations slightly increase price.
+
+Weak positive correlations for features like name length or hotel room type indicate minimal influence. Special characters or uppercase words in the name have almost no impact.
+
+On the negative side, room_type = Private room (-0.52) and Shared room (-0.15) strongly reduce price, as expected. More reviews and higher review frequency also slightly correlate with lower prices, possibly reflecting affordable, high-turnover listings. Other variables (availability, host listing count, positive/sketchy wording) show very small negative correlations.
+
+Overall, room type is the dominant driver of price, while most other features have weak or negligible linear relationships.
+
+#### 2.1.2 Categorical Columns
+
+Spearman correlation does not work for categorical variables correctly (unless they are ordered and encoded correctly), hence we use kruskl-wallis test instead:
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+categorical_cols <- names(df_train)[sapply(df_train, function(x) is.factor(x) || is.character(x))]
+
+cat_results <- data.frame(
+  variable = character(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (col in categorical_cols) {
+  temp_df <- df_train[!is.na(df_train[[col]]) & !is.na(df_train$price), ]
+  if (length(unique(temp_df[[col]])) > 1) {
+    test <- kruskal.test(price ~ temp_df[[col]], data = temp_df)
+    cat_results <- rbind(cat_results, data.frame(variable = col, p_value = test$p.value))
+  }
+}
+
+cat_results <- cat_results[order(cat_results$p_value), ]
+
+print(cat_results)
+
+df_train
+
+```
+
+The p-value is EXTREMELY low, meaning that the neighborhood is statistically significant for the prediction of price.
+
+## Step 3. Modelling
+
+Our correlation analysis has displayed that the room type, neighbourhood, seem to have a statistically significant correlation with the price. Also the rate in which luxury terms appear, the minimum nights per booking, as well as the longitude seem to have a strong effect.
+
+For this modelling step, we decided to proceed with XGBoost, as it deals N/A values in production + also comes with built-in regularization and efficient use of random forest. Also we can use it to tell the importance of the variables in the decision making
+
+### 3.1 Hyperparameter turning
+
+To get the best model for the test, we proceed by tuning the XGBoost parameters, having RMSE for the loss function
+
+first we split into training and validation in order to ensure the hyperparameters is not overfitting the data. There's a lot of data, hence we proceed with a 80/20 split
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+data_split <- initial_split(df_train, prop = 0.8)
+train_df   <- training(data_split)
+val_df    <- testing(data_split)
+y = "price"
+p <- ncol(dplyr::select(train_df, -dplyr::all_of(y)))
+mtry_fixed <- max(1L, floor(0.8 * p))
+
+rec <- recipe(price ~ ., data = train_df) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+```
+
+Then we proceed with the setting of the hyperparametes to tune - there are many too count, and in general we just decided to go with the best practices outlined on XGBoost: <https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/>
+
+#### 3.1.1 Step 1: Fix Learning Rate and Number of Estimators for Tuning Tree-Based Parameters.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+set.seed(42) # setting seed here once again just to be safe :D
+
+folds   <- vfold_cv(train_df, v = 5)
+metrics <- metric_set(rmse)
+ctrl    <- control_grid(verbose = TRUE)
+wf_from_spec <- function(spec) workflow() %>% add_recipe(rec) %>% add_model(spec)
+
+mtry_fixed <- max(1L, floor(0.8 * p))
+
+spec_step1 <- boost_tree(
+  mode           = "regression",
+  trees          = tune(),
+  tree_depth     = 5L,
+  learn_rate     = tune(),
+  min_n          = 1L,
+  loss_reduction = 0.15,
+  mtry           = mtry_fixed,
+  sample_size    = 0.8
+) %>%
+  set_engine("xgboost", eval_metric = "rmse",
+             nthread = max(1, parallel::detectCores() - 1))
+
+wf_step1 <- wf_from_spec(spec_step1)
+
+# A sensible LR set + broad trees range
+rates <- c(0.3, 0.2, 0.1, 0.05, 0.03, 0.025, 0.01, 0.005)
+grid_step1 <- tidyr::expand_grid(
+  learn_rate = rates,
+  trees      = c(5L, 10L, 25L, 50L, 75L, 100L, 150L, 200L, 400, 500L, 750L, 1000L, 1200L)
+)
+
+res_step1  <- tune_grid(wf_step1, resamples = folds, grid = grid_step1,
+                        metrics = metrics, control = ctrl)
+best_step1 <- select_best(res_step1, metric = "rmse")
+
+best_trees <- best_step1$trees
+best_lr    <- best_step1$learn_rate
+
+
+perf_step1 <- make_perf_table(res_step1, wf_step1, train_df, truth = y)
+perf_step1 %>% slice_head(n = 15)
+perf_step1
+
+```
+
+#### 3.1.2 Step 2: Tune max_depth and min_child_weight
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+spec_step2 <- boost_tree(
+  mode           = "regression",
+  trees          = best_trees,
+  tree_depth     = tune(),
+  min_n          = tune(),
+  learn_rate = best_lr,
+  loss_reduction = 0.15,
+  mtry           = mtry_fixed,
+  sample_size    = 0.8
+) %>% set_engine("xgboost", eval_metric = "rmse",
+                 nthread = max(1, parallel::detectCores() - 1))
+
+wf_step2 <- wf_from_spec(spec_step2)
+
+grid_step2 <- grid_latin_hypercube(
+  tree_depth(c(3L, 12L)),
+  min_n(c(1L, 50L)),
+  size = 20
+)
+
+res_step2  <- tune_grid(wf_step2, resamples = folds,
+                        grid = grid_step2, metrics = metrics, control = ctrl)
+best_step2 <- select_best(res_step2, metric = "rmse")
+
+perf_step2 <- make_perf_table(res_step2, wf_step2, train_df, truth = y)
+perf_step2 %>% slice_head(n = 15)
+perf_step2
+```
+
+#### 3.1.3 Step 3: Tune gamma
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+spec_step3 <- boost_tree(
+  mode           = "regression",
+  trees          = best_trees,
+  tree_depth     = best_step2$tree_depth,
+  min_n          = best_step2$min_n,
+  learn_rate     = best_lr,
+  loss_reduction = tune(),
+  mtry           = mtry_fixed,
+  sample_size    = 0.8
+) %>% set_engine("xgboost", eval_metric = "rmse",
+                 nthread = max(1, parallel::detectCores() - 1))
+
+wf_step3 <- wf_from_spec(spec_step3)
+
+grid_step3 <- grid_latin_hypercube(
+  loss_reduction(c(-4, 2)),   # log10 range ≈ [1e-4, 1e2]
+  size = 25
+)
+
+
+res_step3  <- tune_grid(wf_step3, resamples = folds,
+                        grid = grid_step3, metrics = metrics, control = ctrl)
+best_step3 <- select_best(res_step3, metric = "rmse")
+
+gamma_val <- best_step3$loss_reduction
+if (is.numeric(gamma_val) && gamma_val < 0) gamma_val <- 10^gamma_val
+
+perf_step3 <- make_perf_table(res_step3, wf_step3, train_df, truth = y)
+perf_step3 %>% slice_head(n = 15)
+perf_step3
+
+```
+
+#### 3.1.4 Step 4: Tune subsample and colsample_bytree
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+props <- seq(0.5, 0.9, by = 0.1)
+grid_step4 <- tidyr::expand_grid(
+  sample_size = props,
+  mtry        = unique(as.integer(round(seq(0.5, 0.9, by = 0.1) * p)))
+)
+
+
+spec_step4 <- boost_tree(
+  mode           = "regression",
+  trees          = best_trees,
+  tree_depth     = best_step2$tree_depth,
+  min_n          = best_step2$min_n,
+  learn_rate     = best_lr,
+  loss_reduction = {               
+    g <- best_step3$loss_reduction
+    if (is.numeric(g) && g < 0) 10^g else g
+  },
+  sample_size    = tune(),
+  mtry           = tune()
+) %>% set_engine(
+  "xgboost",
+  eval_metric = "rmse",
+  nthread     = max(1, parallel::detectCores() - 1)
+)
+
+wf_step4  <- wf_from_spec(spec_step4)
+res_step4 <- tune_grid(
+  wf_step4,
+  resamples = folds,
+  grid      = grid_step4,
+  metrics   = metrics,
+  control   = ctrl
+)
+
+best_step4 <- select_best(res_step4, metric = "rmse")
+
+perf_step4 <- make_perf_table(res_step4, wf_step4, train_df, truth = y)
+perf_step4 %>% slice_head(n = 15)
+perf_step4
+
+```
+
+#### 3.1.5 Step 5: Tuning Regularization Parameters
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+grid_step5 <- tibble::tibble(
+  lambda = 10^runif(25, -6, 3),  # 1e-6 .. 1e3
+  alpha  = 10^runif(25, -8, 2)   # 1e-8 .. 1e2
+)
+
+spec_step5 <- boost_tree(
+  mode           = "regression",
+  trees          = best_trees,
+  tree_depth     = best_step2$tree_depth,
+  learn_rate     = best_lr,
+  min_n          = best_step2$min_n,
+  loss_reduction = { g <- best_step3$loss_reduction; if (is.numeric(g) && g < 0) 10^g else g },
+  mtry           = best_step4$mtry,
+  sample_size    = best_step4$sample_size
+) %>% set_engine(
+  "xgboost",
+  eval_metric = "rmse",
+  nthread     = max(1, parallel::detectCores() - 1),
+  lambda      = tune(),
+  alpha       = tune()
+)
+
+wf_step5  <- wf_from_spec(spec_step5)
+res_step5 <- tune_grid(wf_step5, resamples = folds, grid = grid_step5, metrics = metrics, control = ctrl)
+best_step5 <- select_best(res_step5, metric = "rmse")
+
+perf_step5 <- make_perf_table(res_step5, wf_step5, train_df, truth = y)
+perf_step5 %>% slice_head(n = 15)
+perf_step5
+
+```
+
+### Step 4. Evaluation
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+grab_step <- function(res, step, fixed = list(), summarize = TRUE) {
+  out <- collect_metrics(res, summarize = summarize) %>%
+    filter(.metric == "rmse") %>%
+    mutate(step = step)
+  if (length(fixed)) {
+    out <- bind_cols(out, as_tibble(fixed))
+  }
+  out
+}
+
+param_cols <- c("trees","learn_rate","tree_depth","min_n","loss_reduction",
+                "sample_size","mtry","lambda","alpha")
+
+step1_tbl <- grab_step(
+  res_step1, "step1_trees_lr",
+  fixed = list(
+    tree_depth = 5L,
+    min_n = 1L,
+    loss_reduction = 0.15,
+    mtry = mtry_fixed,
+    sample_size = 0.8
+  )
+)
+
+step2_tbl <- grab_step(
+  res_step2, "step2_depth_min_n",
+  fixed = list(
+    trees = best_trees,
+    learn_rate = best_lr,
+    loss_reduction = 0.15,
+    mtry = mtry_fixed,
+    sample_size = 0.8
+  )
+)
+
+step3_tbl <- grab_step(
+  res_step3, "step3_gamma",
+  fixed = list(
+    trees = best_trees,
+    learn_rate = best_lr,
+    tree_depth = best_step2$tree_depth,
+    min_n = best_step2$min_n,
+    mtry = mtry_fixed,
+    sample_size = 0.8
+  )
+) %>%
+  mutate(loss_reduction_effective =
+           ifelse(is.numeric(loss_reduction) & loss_reduction < 0,
+                  10^loss_reduction, loss_reduction))
+
+step4_tbl <- grab_step(
+  res_step4, "step4_subsample_mtry",
+  fixed = list(
+    trees = best_trees,
+    learn_rate = best_lr,
+    tree_depth = best_step2$tree_depth,
+    min_n = best_step2$min_n,
+    loss_reduction = { g <- best_step3$loss_reduction; if (is.numeric(g) && g < 0) 10^g else g }
+  )
+)
+
+step5_tbl <- grab_step(
+  res_step5, "step5_lambda_alpha",
+  fixed = list(
+    trees = best_trees,
+    learn_rate = best_lr,
+    tree_depth = best_step2$tree_depth,
+    min_n = best_step2$min_n,
+    loss_reduction = { g <- best_step3$loss_reduction; if (is.numeric(g) && g < 0) 10^g else g },
+    mtry = best_step4$mtry,
+    sample_size = best_step4$sample_size
+  )
+)
+
+all_results <- bind_rows(step1_tbl, step2_tbl, step3_tbl, step4_tbl, step5_tbl) %>%
+  select(step, any_of(c("trees","learn_rate","tree_depth","min_n",
+                        "loss_reduction","sample_size","mtry","lambda","alpha",
+                        "mean","n","std_err",".config"))) %>%
+  mutate(
+    lambda = dplyr::coalesce(lambda, 1),
+    alpha  = dplyr::coalesce(alpha, 0)
+  ) %>%
+  arrange(mean)
+
+all_results %>% slice_head(n = 20)
+
+```
+
+It is found from the examination that the the hyperparameter optimization does not yield much difference between for inference, and the improval is quite minimal. Nevertheless, we find two best models, with them having the same parameters: trees: 1000, learn_rate: 0.1, tree_depth: 8, min_n: 3, loss_reduction: 11.444376973, sample: 0.6, mtry: 10 lambda: 1.0 (default) alpha: 0.0 (default)
+
+the only parameter that differs is the mtry (colsample_bytree) model 1 with mtry = 66 has RMSE 35.18918 ± 0.7464027, while model with mtry = 47 has RMSE 35.20881 ± 0.7076638. While the difference is almost negligible, we decide to go with the model 2 due to the lowest standard deviation (meaning it is more risk averse).
+
+### Step 5. Deployment
+
+here we use our best model to infer the data.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+df_test = read.csv("data/test.csv")
+
+preprocess_abnb <- function(dat) {
+  dat <- dat %>%
+    # drop pure identifiers, cast types
+    select(-ID, -host_id, -host_name) %>%
+    mutate(
+      last_review   = as.numeric(ymd(last_review)),
+      neighbourhood = as.factor(neighbourhood)
+    )
+
+  dat <- dat %>% mutate(reviews_per_month = replace_na(reviews_per_month, 0))
+
+  dat <- dat %>%
+    mutate(availability_365_rate = (365 - availability_365) / 365) %>%
+    select(-availability_365)
+
+  room_dummies <- model.matrix(~ room_type - 1, data = dat) %>% as.data.frame()
+  dat <- bind_cols(dat %>% select(-room_type), room_dummies)
+
+  train_dummy_cols <- grep("^room_type", names(df_train), value = TRUE)
+  missing_cols <- setdiff(train_dummy_cols, names(dat))
+  if (length(missing_cols)) {
+    dat[missing_cols] <- 0L
+  }
+
+  dat <- dat %>%
+    mutate(
+      name_norm = normalize_name(name),
+      name_word_count = if_else(!is.na(name_norm) & name_norm != "",
+                                str_count(name_norm, "\\S+"), 0L),
+      name_special_char_rate = if_else(str_length(name) > 0,
+                                       str_count(name, "[^\\p{L}\\p{N} .&]") / str_length(name), 0),
+      name_luxury_rate   = if_else(name_word_count > 0,
+                                   str_count(name_norm, rx_luxury)   / name_word_count, 0),
+      name_positive_rate = if_else(name_word_count > 0,
+                                   str_count(name_norm, rx_positive) / name_word_count, 0),
+      name_sketchy_rate  = if_else(name_word_count > 0,
+                                   str_count(name_norm, rx_sketchy)  / name_word_count, 0),
+      name_upper_word_rate = if_else(name_word_count > 0,
+                                     str_count(name, "\\b\\p{Lu}+(?:'\\p{Lu}+)*\\b") / name_word_count, 0)
+    ) %>%
+    select(-name_norm, -name)
+
+  dat <- dat %>%
+    mutate(
+      number_of_reviews = log1p(number_of_reviews),
+      reviews_per_month = log1p(reviews_per_month),
+      calculated_host_listings_count = log1p(calculated_host_listings_count),
+      name_special_char_rate = log1p(name_special_char_rate),
+      name_luxury_rate = log1p(name_luxury_rate),
+      name_positive_rate = log1p(name_positive_rate),
+      name_sketchy_rate = log1p(name_sketchy_rate),
+      name_upper_word_rate = log1p(name_upper_word_rate)
+    )
+
+  dat
+}
+
+test_ids <- df_test$ID
+
+df_test_proc <- preprocess_abnb(df_test)
+
+
+final_rec <- recipe(price ~ ., data = df_train) %>%
+step_zv(all_predictors()) %>%
+step_impute_median(all_numeric_predictors()) %>%
+step_other(all_nominal_predictors(), threshold = 0.01) %>%
+step_novel(all_nominal_predictors()) %>%
+step_dummy(all_nominal_predictors())
+
+
+p_final      <- ncol(dplyr::select(df_train, -price))
+mtry_chosen  <- min(47L, p_final)  
+
+final_spec <- boost_tree(
+mode           = "regression",
+trees          = 750L,
+learn_rate     = 0.10,
+tree_depth     = 6L,
+min_n          = 12L,
+loss_reduction = 0.4311075,  # gamma
+sample_size    = 0.5,
+mtry           = mtry_chosen
+) %>%
+set_engine(
+"xgboost",
+eval_metric = "rmse",
+lambda      = 1.0,
+alpha       = 0.0,
+nthread     = max(1, parallel::detectCores() - 1)
+)
+
+final_wf <- workflow() %>%
+add_recipe(final_rec) %>%
+add_model(final_spec)
+
+final_fit <- fit(final_wf, data = df_train)
+
+
+test_preds <- predict(final_fit, new_data = df_test_proc) %>%
+dplyr::rename(price = .pred) %>%
+dplyr::mutate(price = pmax(price, 0)) 
+
+submission <- tibble::tibble(
+ID    = test_ids,
+price = test_preds$price
+)
+
+
+readr::write_csv(submission, "predictions_submission.csv")
+
+head(submission, 10)
+
+data_split <- initial_split(df_train, prop = 0.8)
+train_df   <- training(data_split)
+val_df     <- testing(data_split)
+
+rec_prep <- prep(final_rec)
+
+train_prep <- bake(rec_prep, new_data = train_df)
+val_prep   <- bake(rec_prep, new_data = val_df)
+
+model_train_only <- final_spec %>%
+  fit(price ~ ., data = train_prep)
+
+train_preds_split <- predict(model_train_only, new_data = train_prep) %>% pull(.pred)
+val_preds_split   <- predict(model_train_only, new_data = val_prep)   %>% pull(.pred)
+
+train_rmse_split <- rmse_vec(truth = train_prep$price, estimate = train_preds_split)
+val_rmse_split   <- rmse_vec(truth = val_prep$price,   estimate = val_preds_split)
+
+cat(sprintf("Train RMSE (split model): %.4f\n", train_rmse_split))
+cat(sprintf("Validation RMSE: %.4f\n", val_rmse_split))
+
+```
