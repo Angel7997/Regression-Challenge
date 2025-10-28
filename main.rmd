@@ -308,7 +308,7 @@ missing_table %>%
 
 ```
 
-we see that `reviews_per_month` columns has 475 missing values - we try to examin it to see how we proceed (and check if N/A just means 0)
+we see that `reviews_per_month` columns has 475 missing values - we try to examine it to see how we proceed (and check if N/A just means 0)
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
@@ -316,15 +316,25 @@ df_train %>%
   filter(reviews_per_month == 0 | is.na(reviews_per_month))
 ```
 
-we see that all rows that have N/A for `reviews_per_month` have `number_of_reviews` = 0 so we set `reviews_per_month` to zero
+we see that all rows that have N/A for `reviews_per_month` have `number_of_reviews` = 0 so we set `reviews_per_month` to zero and assigne listings without reviews with a dummy date outside the data range of our dataset: "2010-01-01"
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
 df_train <- df_train %>%
   mutate(
-    reviews_per_month = replace_na(reviews_per_month, 0), 
+    reviews_per_month = tidyr::replace_na(reviews_per_month, 0),
+    last_review = as.Date(last_review, format = "%Y-%m-%d"), 
+    last_review = coalesce(last_review, as.Date("2010-01-01"))
   )
 
+sort(unique(df_train$last_review)) # there are no lines with NA data in last_review column
+
+check_na <- function(df_train) {
+  na_counts <- colSums(is.na(df_train))
+  na_counts[na_counts > 0]
+}
+
+check_na(df_train)
 ```
 
 ### 1.4 - Transforming values
@@ -429,7 +439,36 @@ df_train <- df_train %>%
 
 ```
 
-#### 1.4.3 - Log transformation
+#### 1.4.3 - Augmenting with new data
+
+We hypothesize that, as in most major cities, location is the main determinant of Airbnb prices in Chicago. To test this, we get new data based on the coordinates of each listing.\
+The coordinates of Chicago’s central area were identified from public sources. Because Chicago’s downtown has a relatively rectangular shape, the definition of the city center can be considered reasonably objective.
+
+For each listing, we calculated the distance from the city center (in kilometers). Additionally, using the "neighbourhood" variable, we classified listings into downtown vs. non-downtown categories by marking the neighborhoods that belong to the central area.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+library(ggplot2)
+
+#plot of locations of listings
+ggplot(df_train, aes( longitude, latitude )) +
+  geom_point()   
+
+# a new column "distance from center" in km
+install.packages("geosphere")
+library(geosphere)
+chicago_center <- c(-87.63, 41.88)
+df_train$distance_from_center <- distHaversine(df_train[, c("longitude", "latitude")], chicago_center) / 1000  
+
+# is the listing in the downtown? Y/N
+# Caution: 'is_downtown' and 'distance_from_center' are highly collinear.
+df_train$is_downtown <- ifelse(
+  df_train$neighbourhood %in% c("Loop", "Lower West Side", "Near West Side", "Near North Side", "Near South Side"),
+  TRUE,
+  FALSE)
+```
+
+#### 1.4.4 - Log transformation
 
 We check for right-skewed patterns in the numeric data, in order to make them more linear through log function.
 
@@ -470,7 +509,7 @@ df_train <- df_train %>%
 
 ```
 
-#### 1.4.4 - Outlier Removal
+#### 1.4.5 - Outlier Removal
 
 Now we remove outliers for the numeric columns which can technically have an infinite range (so pretty much anything aside from latitude, longitude, and rates)
 
@@ -528,13 +567,13 @@ cor_table <- data.frame(
 cor_table
 ```
 
-The strongest positive correlation with price is room_type = Entire home/apt (+0.54), meaning full units are significantly more expensive. Luxury wording in the name (+0.20), minimum_nights (+0.18), and longitude (+0.17) show small positive effects, suggesting upscale wording, longer stays, or certain locations slightly increase price.
+The strongest positive correlation with price is room_type = Entire home/apt (+0.54), meaning full units are significantly more expensive. Luxury wording in the name (+0.18), minimum_nights (+0.11), and longitude (+0.17) show small positive effects, suggesting upscale wording, longer stays, or certain locations slightly increase price.
 
 Weak positive correlations for features like name length or hotel room type indicate minimal influence. Special characters or uppercase words in the name have almost no impact.
 
-On the negative side, room_type = Private room (-0.52) and Shared room (-0.15) strongly reduce price, as expected. More reviews and higher review frequency also slightly correlate with lower prices, possibly reflecting affordable, high-turnover listings. Other variables (availability, host listing count, positive/sketchy wording) show very small negative correlations.
+On the negative side, distance_from_center (-0,29) room_type = Private room (-0.54) and Shared room (-0.15) strongly reduce price, as expected. More reviews and higher review frequency also slightly correlate with lower prices, possibly reflecting affordable, high-turnover listings. Other variables (availability, host listing count, positive/sketchy wording) show very small negative correlations.
 
-Overall, room type is the dominant driver of price, while most other features have weak or negligible linear relationships.
+Overall, room type and location is the dominant driver of price, while most other features have weak or negligible linear relationships.
 
 #### 2.1.2 Categorical Columns
 
