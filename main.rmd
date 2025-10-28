@@ -6,7 +6,9 @@ output: html_document
 
 # Project: MLAI 2025 Regression Challenge
 
-**Team Members**: Gabriel Witte, Nataliia Korobkova, Muhammad Saim, Areeb **Description**: Here we present a detailed ML pipeline following the CRISP-DM standard for the AirBnB dataset.
+**Team Members**: Gabriel Witte, Nataliia Korobkova, Muhammad Saim, Ali Areeb, Alina Porschke
+
+**Description**: Here we present a detailed ML pipeline following the CRISP-DM standard for the AirBnB dataset.
 
 ## Step 0. Imports and dependencies
 
@@ -35,12 +37,12 @@ set.seed(42) # we set a deterministic seed to output the same results no matter 
 remove_outliers_iqr <- function(x) {
   if (!is.numeric(x)) stop("Input must be numeric")
 
-  Q1 <- quantile(x, 0.25, na.rm = TRUE)
-  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  Q05 <- quantile(x, 0.05, na.rm = TRUE)
+  Q95 <- quantile(x, 0.95, na.rm = TRUE)
   IQR_value <- IQR(x, na.rm = TRUE)
 
-  lower_bound <- Q1 - 1.5 * IQR_value
-  upper_bound <- Q3 + 1.5 * IQR_value
+  lower_bound <- Q05 - 1.5 * IQR_value
+  upper_bound <- Q95 + 1.5 * IQR_value
 
   x >= lower_bound & x <= upper_bound
 }
@@ -90,8 +92,6 @@ make_perf_table <- function(res, wf, train_df, truth, metric_name = "rmse") {
     dplyr::mutate(gap = rmse_val - rmse_train) %>%
     dplyr::arrange(rmse_val)
 }
-
-
 ```
 
 ## Step: 1. Data Understanding
@@ -112,8 +112,7 @@ df_train %>%
   )
 
 df_train %>%
-  glimpse() %>%
-  head(10)
+ summary()
 
 # In general we see the the following data:
 
@@ -216,7 +215,6 @@ unique(df_train$room_type)
 # Description: The amount of listings the host offers.
 # Useful for inference: Possible, have to check.
 # values: range(0, inf)
-
 
 # Variable: availability_365
 # Data type: int
