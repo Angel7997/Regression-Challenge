@@ -323,7 +323,6 @@ we see that all rows that have N/A for `reviews_per_month` have `number_of_revie
 df_train <- df_train %>%
   mutate(
     reviews_per_month = tidyr::replace_na(reviews_per_month, 0),
-    last_review = as.Date(last_review, format = "%Y-%m-%d"), 
     last_review = coalesce(last_review, as.Date("2010-01-01"))
   )
 
@@ -444,7 +443,7 @@ df_train <- df_train %>%
 We hypothesize that, as in most major cities, location is the main determinant of Airbnb prices in Chicago. To test this, we get new data based on the coordinates of each listing.\
 The coordinates of Chicago’s central area were identified from public sources. Because Chicago’s downtown has a relatively rectangular shape, the definition of the city center can be considered reasonably objective.
 
-For each listing, we calculated the distance from the city center (in kilometers). Additionally, using the "neighbourhood" variable, we classified listings into downtown vs. non-downtown categories by marking the neighborhoods that belong to the central area.
+For each listing, we calculated the distance from the city center (in kilometers). Additionally, using the "neighbourhood" variable to classify listings into downtown vs. non-downtown categories by marking the neighborhoods that belong to the central area.
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
@@ -461,11 +460,14 @@ chicago_center <- c(-87.63, 41.88)
 df_train$distance_from_center <- distHaversine(df_train[, c("longitude", "latitude")], chicago_center) / 1000  
 
 # is the listing in the downtown? Y/N
-# Caution: 'is_downtown' and 'distance_from_center' are highly collinear.
-df_train$is_downtown <- ifelse(
-  df_train$neighbourhood %in% c("Loop", "Lower West Side", "Near West Side", "Near North Side", "Near South Side"),
-  TRUE,
-  FALSE)
+# Caution: 'is_downtown' and 'distance_from_center' are collinear.
+df_train <- df_train %>%
+  mutate(
+    is_downtown = if_else(
+      neighbourhood %in% c("Loop", "Lower West Side", "Near West Side", "Near North Side", "Near South Side"),
+      "1", "0"
+    ) %>% as.factor()
+  )
 ```
 
 #### 1.4.4 - Log transformation
@@ -537,7 +539,8 @@ df_train
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
-df_train$last_review <- as.numeric(as.Date(df_train$last_review)) # we get the numeric value of last_review for the correlation analysis
+df_train$last_review <- as.numeric(as.Date(df_train$last_review)) 
+df_train$is_downtown <- as.numeric(as.character(df_train$is_downtown)) # we get the numeric value of last_review and is_downtown for the correlation analysis
 
 numeric_cols <- names(df_train)[sapply(df_train, is.numeric)]
 
@@ -567,11 +570,11 @@ cor_table <- data.frame(
 cor_table
 ```
 
-The strongest positive correlation with price is room_type = Entire home/apt (+0.54), meaning full units are significantly more expensive. Luxury wording in the name (+0.18), minimum_nights (+0.11), and longitude (+0.17) show small positive effects, suggesting upscale wording, longer stays, or certain locations slightly increase price.
+The strongest positive correlation with price is room_type = Entire home/apt (+0.56), meaning full units are significantly more expensive. Luxury wording in the name (+0.18), minimum_nights (+0.10), and longitude (+0.18) show small positive effects, suggesting upscale wording, longer stays, or certain locations slightly increase price.
 
 Weak positive correlations for features like name length or hotel room type indicate minimal influence. Special characters or uppercase words in the name have almost no impact.
 
-On the negative side, distance_from_center (-0,29) room_type = Private room (-0.54) and Shared room (-0.15) strongly reduce price, as expected. More reviews and higher review frequency also slightly correlate with lower prices, possibly reflecting affordable, high-turnover listings. Other variables (availability, host listing count, positive/sketchy wording) show very small negative correlations.
+On the negative side, distance_from_center (-0,31) room_type = Private room (-0.54) and Shared room (-0.15) strongly reduce price, as expected. More reviews and higher review frequency also slightly correlate with lower prices, possibly reflecting affordable, high-turnover listings. Other variables (availability, host listing count, positive/sketchy wording) show very small negative correlations.
 
 Overall, room type and location is the dominant driver of price, while most other features have weak or negligible linear relationships.
 
@@ -609,9 +612,9 @@ The p-value is EXTREMELY low, meaning that the neighborhood is statistically sig
 
 ## Step 3. Modelling
 
-Our correlation analysis has displayed that the room type, neighbourhood, seem to have a statistically significant correlation with the price. Also the rate in which luxury terms appear, the minimum nights per booking, as well as the longitude seem to have a strong effect.
+Our correlation analysis has displayed that the room type and location seem to have a statistically significant correlation with the price. Also the rate in which luxury terms appear, the minimum nights per booking seem to have a strong effect.
 
-For this modelling step, we decided to proceed with XGBoost, as it deals N/A values in production + also comes with built-in regularization and efficient use of random forest. Also we can use it to tell the importance of the variables in the decision making
+For this modelling step, we decided to proceed with XGBoost, as it deals N/A values in production + also comes with built-in regularization and efficient use of random forest. Also we can use it to determine the importance of the variables in the decision making.
 
 ### 3.1 Hyperparameter turning
 
@@ -646,7 +649,7 @@ Then we proceed with the setting of the hyperparametes to tune - there are many 
 set.seed(42) # setting seed here once again just to be safe :D
 
 folds   <- vfold_cv(train_df, v = 5)
-metrics <- metric_set(rmse)
+metrics <- yardstick::metric_set(yardstick::rmse)
 ctrl    <- control_grid(verbose = TRUE)
 wf_from_spec <- function(spec) workflow() %>% add_recipe(rec) %>% add_model(spec)
 
@@ -676,11 +679,11 @@ grid_step1 <- tidyr::expand_grid(
 
 res_step1  <- tune_grid(wf_step1, resamples = folds, grid = grid_step1,
                         metrics = metrics, control = ctrl)
+
 best_step1 <- select_best(res_step1, metric = "rmse")
 
 best_trees <- best_step1$trees
 best_lr    <- best_step1$learn_rate
-
 
 perf_step1 <- make_perf_table(res_step1, wf_step1, train_df, truth = y)
 perf_step1 %>% slice_head(n = 15)
@@ -949,12 +952,16 @@ preprocess_abnb <- function(dat) {
     # drop pure identifiers, cast types
     select(-ID, -host_id, -host_name) %>%
     mutate(
-      last_review   = as.numeric(ymd(last_review)),
-      neighbourhood = as.factor(neighbourhood)
-    )
-
-  dat <- dat %>% mutate(reviews_per_month = replace_na(reviews_per_month, 0))
-
+      neighbourhood = as.factor(neighbourhood),
+      last_review = ymd(last_review),
+      last_review = coalesce(last_review, as.Date("2010-01-01")),
+      last_review = as.numeric(last_review),
+      distance_from_center = distHaversine(dat[, c("longitude", "latitude")], chicago_center) / 1000,
+      is_downtown = if_else(neighbourhood %in% c("Loop", "Lower West Side", "Near West Side", "Near North Side", "Near South Side"),
+      1, 0  ), 
+      reviews_per_month = tidyr::replace_na(reviews_per_month, 0)
+  )
+    
   dat <- dat %>%
     mutate(availability_365_rate = (365 - availability_365) / 365) %>%
     select(-availability_365)
@@ -1005,7 +1012,6 @@ test_ids <- df_test$ID
 
 df_test_proc <- preprocess_abnb(df_test)
 
-
 final_rec <- recipe(price ~ ., data = df_train) %>%
 step_zv(all_predictors()) %>%
 step_impute_median(all_numeric_predictors()) %>%
@@ -1013,24 +1019,23 @@ step_other(all_nominal_predictors(), threshold = 0.01) %>%
 step_novel(all_nominal_predictors()) %>%
 step_dummy(all_nominal_predictors())
 
-
 p_final      <- ncol(dplyr::select(df_train, -price))
 mtry_chosen  <- min(47L, p_final)  
 
 final_spec <- boost_tree(
 mode           = "regression",
 trees          = 750L,
-learn_rate     = 0.10,
+learn_rate     = 0.010,
 tree_depth     = 6L,
-min_n          = 12L,
-loss_reduction = 0.4311075,  # gamma
-sample_size    = 0.5,
+min_n          = 19L,
+loss_reduction = 0.03,  # gamma
+sample_size    = 0.8,
 mtry           = mtry_chosen
 ) %>%
 set_engine(
 "xgboost",
 eval_metric = "rmse",
-lambda      = 1.0,
+lambda      = 0.686,
 alpha       = 0.0,
 nthread     = max(1, parallel::detectCores() - 1)
 )
@@ -1041,7 +1046,6 @@ add_model(final_spec)
 
 final_fit <- fit(final_wf, data = df_train)
 
-
 test_preds <- predict(final_fit, new_data = df_test_proc) %>%
 dplyr::rename(price = .pred) %>%
 dplyr::mutate(price = pmax(price, 0)) 
@@ -1050,7 +1054,6 @@ submission <- tibble::tibble(
 ID    = test_ids,
 price = test_preds$price
 )
-
 
 readr::write_csv(submission, "predictions_submission.csv")
 
@@ -1072,9 +1075,8 @@ train_preds_split <- predict(model_train_only, new_data = train_prep) %>% pull(.
 val_preds_split   <- predict(model_train_only, new_data = val_prep)   %>% pull(.pred)
 
 train_rmse_split <- rmse_vec(truth = train_prep$price, estimate = train_preds_split)
-val_rmse_split   <- rmse_vec(truth = val_prep$price,   estimate = val_preds_split)
+val_rmse_split   <- rmse_vec(truth = val_prep$price, estimate = val_preds_split)
 
 cat(sprintf("Train RMSE (split model): %.4f\n", train_rmse_split))
 cat(sprintf("Validation RMSE: %.4f\n", val_rmse_split))
-
 ```
