@@ -1042,7 +1042,7 @@ perf_step5
 
 ```
 
-### Step 4. Evaluation
+### Step 4. Evaluation of Model Tuning Process
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
@@ -1134,9 +1134,7 @@ all_results %>% slice_head(n = 20)
 
 ```
 
-It is found from the examination that the the hyperparameter optimization does not yield much difference between for inference, and the improval is quite minimal. Nevertheless, we find two best models, with them having the same parameters: trees: 1000, learn_rate: 0.1, tree_depth: 8, min_n: 3, loss_reduction: 11.444376973, sample: 0.6, mtry: 10 lambda: 1.0 (default) alpha: 0.0 (default)
-
-the only parameter that differs is the mtry (colsample_bytree) model 1 with mtry = 66 has RMSE 35.18918 ± 0.7464027, while model with mtry = 47 has RMSE 35.20881 ± 0.7076638. While the difference is almost negligible, we decide to go with the model 2 due to the lowest standard deviation (meaning it is more risk averse).
+It is found from the examination of the table that the the hyperparameter optimization does not yield much difference between the results of Steps 1-5 and overall evaluation of Model Tuning Process, and the improval is quite minimal. Thus, we find one best model, with the parameters: trees: 1200, learn_rate: 0.1, tree_depth: 6, min_n: 10, loss_reduction: 0.0245, sample: 0.9, mtry: 13 lambda: 1.0 (default) alpha: 0.0 (default).
 
 ### Step 5. Deployment
 
