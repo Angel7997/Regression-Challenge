@@ -1,17 +1,37 @@
 ---
 title: "MLAI 2025 Regression Challenge"
-output: html_document
----s
+output:
+  pdf_document: default
+  html_document:
+    includes:
+      before_body: Title.tex
 ---
 
 # Project: MLAI 2025 Regression Challenge
 
-**Team Members**: Gabriel Witte, Nataliia Korobkova, Muhammad Saim, Areeb **Description**: Here we present a detailed ML pipeline following the CRISP-DM standard for the AirBnB dataset.
+**Team Members**: Gabriel Witte, Nataliia Korobkova, Muhammad Saim, Ali Areeb, Alina Porschke
+
+**Description**: Here we present a detailed ML pipeline following the CRISP-DM standard for the AirBnB dataset.
 
 ## Step 0. Imports and dependencies
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
+# care for nessesary packages
+required_pkgs <- c("ranger", "kernlab", "glmnet", "geosphere")
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+library(ggplot2)
+library(tidymodels)
+library(dplyr)
+library(kernlab)
+library(ranger)
+library(glmnet)
+library(geosphere)
 library(tidyverse)
 library(tidymodels)
 library(stringr)
@@ -35,12 +55,12 @@ set.seed(42) # we set a deterministic seed to output the same results no matter 
 remove_outliers_iqr <- function(x) {
   if (!is.numeric(x)) stop("Input must be numeric")
 
-  Q1 <- quantile(x, 0.25, na.rm = TRUE)
-  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  Q05 <- quantile(x, 0.05, na.rm = TRUE)
+  Q95 <- quantile(x, 0.95, na.rm = TRUE)
   IQR_value <- IQR(x, na.rm = TRUE)
 
-  lower_bound <- Q1 - 1.5 * IQR_value
-  upper_bound <- Q3 + 1.5 * IQR_value
+  lower_bound <- Q05 - 1.5 * IQR_value
+  upper_bound <- Q95 + 1.5 * IQR_value
 
   x >= lower_bound & x <= upper_bound
 }
@@ -90,8 +110,6 @@ make_perf_table <- function(res, wf, train_df, truth, metric_name = "rmse") {
     dplyr::mutate(gap = rmse_val - rmse_train) %>%
     dplyr::arrange(rmse_val)
 }
-
-
 ```
 
 ## Step: 1. Data Understanding
@@ -112,8 +130,7 @@ df_train %>%
   )
 
 df_train %>%
-  glimpse() %>%
-  head(10)
+ summary()
 
 # In general we see the the following data:
 
@@ -217,7 +234,6 @@ unique(df_train$room_type)
 # Useful for inference: Possible, have to check.
 # values: range(0, inf)
 
-
 # Variable: availability_365
 # Data type: int
 # Variable type: Nominal/Quantitative -> Discrete
@@ -310,7 +326,7 @@ missing_table %>%
 
 ```
 
-we see that `reviews_per_month` columns has 475 missing values - we try to examin it to see how we proceed (and check if N/A just means 0)
+we see that `reviews_per_month` columns has 475 missing values - we try to examine it to see how we proceed (and check if N/A just means 0)
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
@@ -318,15 +334,22 @@ df_train %>%
   filter(reviews_per_month == 0 | is.na(reviews_per_month))
 ```
 
-we see that all rows that have N/A for `reviews_per_month` have `number_of_reviews` = 0 so we set `reviews_per_month` to zero
+we see that all rows that have N/A for `reviews_per_month` have `number_of_reviews` = 0 so we set `reviews_per_month` to zero and assigne listings without reviews with a dummy date outside the data range of our dataset: "2010-01-01"
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
 df_train <- df_train %>%
   mutate(
-    reviews_per_month = replace_na(reviews_per_month, 0), 
+    reviews_per_month = tidyr::replace_na(reviews_per_month, 0),
+    last_review = coalesce(last_review, as.Date("2010-01-01"))
   )
 
+check_na <- function(df_train) {
+  na_counts <- colSums(is.na(df_train))
+  na_counts[na_counts > 0]
+}
+
+check_na(df_train)
 ```
 
 ### 1.4 - Transforming values
@@ -431,7 +454,37 @@ df_train <- df_train %>%
 
 ```
 
-#### 1.4.3 - Log transformation
+#### 1.4.3 - Augmenting with new data
+
+We hypothesize that, as in most major cities, location is the main determinant of Airbnb prices in Chicago. To test this, we get new data based on the coordinates of each listing.\
+The coordinates of Chicago’s central area were identified from public sources. Because Chicago’s downtown has a relatively rectangular shape, the definition of the city center can be considered reasonably objective.
+
+For each listing, we calculated the distance from the city center (in kilometers). Additionally, using the "neighbourhood" variable to classify listings into downtown vs. non-downtown categories by marking the neighborhoods that belong to the central area.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+
+#plot of locations of listings
+ggplot(df_train, aes( longitude, latitude, color = price )) +
+  geom_point(alpha = 0.6, size = 1) +
+  scale_color_viridis_c(trans = "log10") +
+  labs(title = "Price (log) and locations")
+
+# a new column "distance from center" in km
+chicago_center <- c(-87.63, 41.88)
+df_train$distance_from_center <- distHaversine(df_train[, c("longitude", "latitude")], chicago_center) / 1000  
+
+# is the listing in the downtown? Y/N
+# Caution: 'is_downtown' and 'distance_from_center' are collinear.
+df_train <- df_train %>%
+  mutate(
+    is_downtown = if_else(
+      neighbourhood %in% c("Loop", "Lower West Side", "Near West Side", "Near North Side", "Near South Side"),
+      "1", "0"
+    ) %>% as.factor()
+  )
+```
+
+#### 1.4.4 - Log transformation
 
 We check for right-skewed patterns in the numeric data, in order to make them more linear through log function.
 
@@ -472,7 +525,7 @@ df_train <- df_train %>%
 
 ```
 
-#### 1.4.4 - Outlier Removal
+#### 1.4.5 - Outlier Removal
 
 Now we remove outliers for the numeric columns which can technically have an infinite range (so pretty much anything aside from latitude, longitude, and rates)
 
@@ -490,6 +543,67 @@ df_train <- df_train %>%
 
 df_train
 
+# Visualizations of the preprocessed data set
+df_train %>%
+  keep(is.numeric) %>%                     # Keep only numeric columns
+  gather() %>%                             # Convert to key-value pairs
+  ggplot(aes(value)) +                     # Plot the values
+  facet_wrap(~ key, scales = "free") +   # In separate panels
+  geom_histogram()                       # As histogram
+
+# Visualizations of text features
+text_feature_summary <- df_train %>%
+  summarise(
+    luxury_mean   = mean(name_luxury_rate, na.rm = TRUE),
+    positive_mean = mean(name_positive_rate, na.rm = TRUE),
+    sketchy_mean  = mean(name_sketchy_rate, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(),
+               names_to = "feature",
+               values_to = "mean_rate") %>%
+  mutate(
+    feature = recode(feature,
+                     "luxury_mean"   = "Luxury terms",
+                     "positive_mean" = "Positive terms",
+                     "sketchy_mean"  = "Sketchy terms")
+  )
+
+# histograms of distributions
+df_train %>%
+  select(name_luxury_rate, name_positive_rate, name_sketchy_rate) %>%
+  pivot_longer(cols = everything(),
+               names_to = "feature",
+               values_to = "rate") %>%
+  mutate(feature = recode(feature,
+                          "name_luxury_rate"   = "Luxury terms",
+                          "name_positive_rate" = "Positive terms",
+                          "name_sketchy_rate"  = "Sketchy terms")) %>%
+  ggplot(aes(x = rate, fill = feature)) +
+  geom_histogram(bins = 50, alpha = 0.7, color = "black") +
+  facet_wrap(~feature, scales = "free_y") +
+  scale_x_continuous(labels = percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Distribution of Keyword Proportions in Airbnb Listing Titles",
+    x = "Proportion of Matching Words in Title",
+    y = "Number of Listings",
+    fill = "Word Type"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+# bar chart of average values
+ggplot(text_feature_summary, aes(x = feature, y = mean_rate, fill = feature)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = percent(mean_rate, accuracy = 0.01)),
+            vjust = -0.5, size = 4) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Average Proportion of 'Sentiment' Words in Listing Titles",
+    x = NULL, y = "Average Word Proportion"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
 ```
 
 ## Step 2. Data Analysis
@@ -500,7 +614,8 @@ df_train
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
-df_train$last_review <- as.numeric(as.Date(df_train$last_review)) # we get the numeric value of last_review for the correlation analysis
+df_train$last_review <- as.numeric(as.Date(df_train$last_review)) 
+df_train$is_downtown <- as.numeric(as.character(df_train$is_downtown)) # we get the numeric value of last_review and is_downtown for the correlation analysis
 
 numeric_cols <- names(df_train)[sapply(df_train, is.numeric)]
 
@@ -530,13 +645,13 @@ cor_table <- data.frame(
 cor_table
 ```
 
-The strongest positive correlation with price is room_type = Entire home/apt (+0.54), meaning full units are significantly more expensive. Luxury wording in the name (+0.20), minimum_nights (+0.18), and longitude (+0.17) show small positive effects, suggesting upscale wording, longer stays, or certain locations slightly increase price.
+The strongest positive correlation with price is room_type = Entire home/apt (+0.55), meaning full units are significantly more expensive. Luxury wording in the name (+0.18), minimum_nights (+0.13), and longitude (+0.19) show small positive effects, suggesting upscale wording, longer stays, or certain locations slightly increase price.
 
 Weak positive correlations for features like name length or hotel room type indicate minimal influence. Special characters or uppercase words in the name have almost no impact.
 
-On the negative side, room_type = Private room (-0.52) and Shared room (-0.15) strongly reduce price, as expected. More reviews and higher review frequency also slightly correlate with lower prices, possibly reflecting affordable, high-turnover listings. Other variables (availability, host listing count, positive/sketchy wording) show very small negative correlations.
+On the negative side, distance_from_center (-0,32) room_type = Private room (-0.53) and Shared room (-0.15) strongly reduce price, as expected. More reviews and higher review frequency also slightly correlate with lower prices, possibly reflecting affordable, high-turnover listings. Other variables (availability, host listing count, positive/sketchy wording) show very small negative correlations.
 
-Overall, room type is the dominant driver of price, while most other features have weak or negligible linear relationships.
+Overall, room type and location is the dominant driver of price, while most other features have weak or negligible linear relationships.
 
 #### 2.1.2 Categorical Columns
 
@@ -572,15 +687,125 @@ The p-value is EXTREMELY low, meaning that the neighborhood is statistically sig
 
 ## Step 3. Modelling
 
-Our correlation analysis has displayed that the room type, neighbourhood, seem to have a statistically significant correlation with the price. Also the rate in which luxury terms appear, the minimum nights per booking, as well as the longitude seem to have a strong effect.
+Our correlation analysis has displayed that the room type and location seem to have a statistically significant correlation with the price. Also the rate in which luxury terms appear, the minimum nights per booking seem to have a strong effect.
 
-For this modelling step, we decided to proceed with XGBoost, as it deals N/A values in production + also comes with built-in regularization and efficient use of random forest. Also we can use it to tell the importance of the variables in the decision making
+For this modelling step, we decided to proceed with XGBoost, as it deals N/A values in production + also comes with built-in regularization and efficient use of random forest. Also we can use it to determine the importance of the variables in the decision making.
+
+Before that we made a quick check of other possible models to make sure that XGBoost is tha best option on our data, as we assume.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+#Test other models to make sure, that XGBoost model gives the best outcomes.
+
+set.seed(42)
+
+# 1. Preparation
+y <- "price"
+
+rec <- recipe(price ~ ., data = df_train) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+folds <- vfold_cv(df_train, v = 5)
+metrics <- yardstick::metric_set(yardstick::rmse)
+
+# 2. Models
+# OLS
+ols_spec <- linear_reg(mode = "regression") %>%
+  set_engine("lm")
+
+# Ridge
+ridge_spec <- linear_reg(
+  mode = "regression",
+  penalty = tune(),
+  mixture = 0   # mixture=0 → Ridge
+) %>% set_engine("glmnet")
+
+# Lasso
+lasso_spec <- linear_reg(
+  mode = "regression",
+  penalty = tune(),
+  mixture = 1   # mixture=1 → Lasso
+) %>% set_engine("glmnet")
+
+# Random Forest
+rf_spec <- rand_forest(
+  mode = "regression",
+  trees = 500,
+  mtry = tune(),
+  min_n = tune()
+) %>% set_engine("ranger")
+
+# Support Vector Regression
+svr_spec <- svm_rbf(
+  mode = "regression",
+  cost = tune(),
+  rbf_sigma = tune()
+) %>% set_engine("kernlab")
+
+# 3. workflows
+wf_ols <- workflow() %>% add_recipe(rec) %>% add_model(ols_spec)
+wf_ridge <- workflow() %>% add_recipe(rec) %>% add_model(ridge_spec)
+wf_lasso <- workflow() %>% add_recipe(rec) %>% add_model(lasso_spec)
+wf_rf <- workflow() %>% add_recipe(rec) %>% add_model(rf_spec)
+wf_svr <- workflow() %>% add_recipe(rec) %>% add_model(svr_spec)
+
+# 4. Nets for hyperparameters
+ridge_grid <- grid_regular(penalty(range = c(-4, 1)), levels = 10)
+lasso_grid <- grid_regular(penalty(range = c(-4, 1)), levels = 10)
+
+rf_grid <- grid_latin_hypercube(
+  mtry(range = c(5, 20)),
+  min_n(range = c(2, 10)),
+  size = 10
+)
+
+svr_grid <- grid_latin_hypercube(
+  cost(range = c(-2, 2)),
+  rbf_sigma(range = c(-2, 0)),
+  size = 10
+)
+
+ctrl <- control_grid(verbose = TRUE)
+
+# 5. Cross-validation
+res_ols <- fit_resamples(wf_ols, resamples = folds, metrics = metrics, control = ctrl)
+res_ridge <- tune_grid(wf_ridge, resamples = folds, grid = ridge_grid, metrics = metrics, control = ctrl)
+res_lasso <- tune_grid(wf_lasso, resamples = folds, grid = lasso_grid, metrics = metrics, control = ctrl)
+res_rf <- tune_grid(wf_rf, resamples = folds, grid = rf_grid, metrics = metrics, control = ctrl)
+res_svr <- tune_grid(wf_svr, resamples = folds, grid = svr_grid, metrics = metrics, control = ctrl)
+
+# 6. Comparision
+collect_metrics(res_ols) %>% mutate(model="OLS")
+collect_metrics(res_ridge) %>% mutate(model="Ridge")
+collect_metrics(res_lasso) %>% mutate(model="Lasso")
+collect_metrics(res_rf) %>% mutate(model="Random Forest")
+collect_metrics(res_svr) %>% mutate(model="SVR") -> all_metrics
+
+all_metrics_df <- bind_rows(
+  collect_metrics(res_ols) %>% mutate(model="OLS"),
+  collect_metrics(res_ridge) %>% mutate(model="Ridge"),
+  collect_metrics(res_lasso) %>% mutate(model="Lasso"),
+  collect_metrics(res_rf) %>% mutate(model="Random Forest"),
+  collect_metrics(res_svr) %>% mutate(model="SVR")
+)
+
+# RMSE 
+all_metrics_df %>%
+  filter(.metric == "rmse") %>%
+  select(model, mean, std_err) %>%
+  arrange(mean)
+```
+
+The best result has Random Forest with RSME 67.52. We just leave it here for now and get back to it later.
 
 ### 3.1 Hyperparameter turning
 
-To get the best model for the test, we proceed by tuning the XGBoost parameters, having RMSE for the loss function
+We proceed by tuning the XGBoost parameters, having RMSE for the loss function.
 
-first we split into training and validation in order to ensure the hyperparameters is not overfitting the data. There's a lot of data, hence we proceed with a 80/20 split
+First we split into training and validation in order to ensure the hyperparameters are not overfitting the data. There's a lot of data, hence we proceed with a 80/20 split
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
@@ -600,21 +825,24 @@ rec <- recipe(price ~ ., data = train_df) %>%
 
 ```
 
-Then we proceed with the setting of the hyperparametes to tune - there are many too count, and in general we just decided to go with the best practices outlined on XGBoost: <https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/>
+Then we proceed with the setting of the hyperparametes to tune - there are many to count, and in general we just decided to go with the best practices outlined on XGBoost: <https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/>
 
-#### 3.1.1 Step 1: Fix Learning Rate and Number of Estimators for Tuning Tree-Based Parameters.
+#### 3.1.1 Step 1: Selection of Learning Rate and Number of Estimators for Tuning Tree-Based Parameters.
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
 set.seed(42) # setting seed here once again just to be safe :D
 
+#Creating cross-validation and metrics
 folds   <- vfold_cv(train_df, v = 5)
-metrics <- metric_set(rmse)
+metrics <- yardstick::metric_set(yardstick::rmse)
 ctrl    <- control_grid(verbose = TRUE)
 wf_from_spec <- function(spec) workflow() %>% add_recipe(rec) %>% add_model(spec)
 
+#Setting the XGBoost model
 mtry_fixed <- max(1L, floor(0.8 * p))
 
+#Configuring the XGBoost model
 spec_step1 <- boost_tree(
   mode           = "regression",
   trees          = tune(),
@@ -628,33 +856,39 @@ spec_step1 <- boost_tree(
   set_engine("xgboost", eval_metric = "rmse",
              nthread = max(1, parallel::detectCores() - 1))
 
+#Defining the workflow build function
 wf_step1 <- wf_from_spec(spec_step1)
 
-# A sensible LR set + broad trees range
+# A sensible LR set + broad trees range. We form hyperparameter grid
 rates <- c(0.3, 0.2, 0.1, 0.05, 0.03, 0.025, 0.01, 0.005)
 grid_step1 <- tidyr::expand_grid(
   learn_rate = rates,
   trees      = c(5L, 10L, 25L, 50L, 75L, 100L, 150L, 200L, 400, 500L, 750L, 1000L, 1200L)
 )
 
+#Starting the selection of hyperparameters
 res_step1  <- tune_grid(wf_step1, resamples = folds, grid = grid_step1,
                         metrics = metrics, control = ctrl)
+
 best_step1 <- select_best(res_step1, metric = "rmse")
 
 best_trees <- best_step1$trees
 best_lr    <- best_step1$learn_rate
 
-
+#Generating a performance table
 perf_step1 <- make_perf_table(res_step1, wf_step1, train_df, truth = y)
 perf_step1 %>% slice_head(n = 15)
 perf_step1
 
 ```
 
+The line with "trees 750, learn_rate 0.010, RSME 65.23719, gap 13.53" looks like the best combination of RSME and gap.
+
 #### 3.1.2 Step 2: Tune max_depth and min_child_weight
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
+#Defining the model for the 2. stage
 spec_step2 <- boost_tree(
   mode           = "regression",
   trees          = best_trees,
@@ -667,16 +901,21 @@ spec_step2 <- boost_tree(
 ) %>% set_engine("xgboost", eval_metric = "rmse",
                  nthread = max(1, parallel::detectCores() - 1))
 
+#Creating a workflow
 wf_step2 <- wf_from_spec(spec_step2)
 
+#Creating a hyperparameter space
 grid_step2 <- grid_latin_hypercube(
   tree_depth(c(3L, 12L)),
   min_n(c(1L, 50L)),
   size = 20
 )
 
+#CV
 res_step2  <- tune_grid(wf_step2, resamples = folds,
                         grid = grid_step2, metrics = metrics, control = ctrl)
+
+#Choosing the best combination
 best_step2 <- select_best(res_step2, metric = "rmse")
 
 perf_step2 <- make_perf_table(res_step2, wf_step2, train_df, truth = y)
@@ -803,7 +1042,7 @@ perf_step5
 
 ```
 
-### Step 4. Evaluation
+### Step 4. Evaluation of Model Tuning Process
 
 ```{r, echo=TRUE, message=FALSE, warning=FALSE}
 
@@ -895,9 +1134,7 @@ all_results %>% slice_head(n = 20)
 
 ```
 
-It is found from the examination that the the hyperparameter optimization does not yield much difference between for inference, and the improval is quite minimal. Nevertheless, we find two best models, with them having the same parameters: trees: 1000, learn_rate: 0.1, tree_depth: 8, min_n: 3, loss_reduction: 11.444376973, sample: 0.6, mtry: 10 lambda: 1.0 (default) alpha: 0.0 (default)
-
-the only parameter that differs is the mtry (colsample_bytree) model 1 with mtry = 66 has RMSE 35.18918 ± 0.7464027, while model with mtry = 47 has RMSE 35.20881 ± 0.7076638. While the difference is almost negligible, we decide to go with the model 2 due to the lowest standard deviation (meaning it is more risk averse).
+It is found from the examination of the table that the the hyperparameter optimization does not yield much difference between the results of Steps 1-5 and overall evaluation of Model Tuning Process, and the improval is quite minimal. Thus, we find one best model, with the parameters: trees: 1200, learn_rate: 0.1, tree_depth: 6, min_n: 10, loss_reduction: 0.0245, sample: 0.9, mtry: 13 lambda: 1.0 (default) alpha: 0.0 (default).
 
 ### Step 5. Deployment
 
@@ -912,12 +1149,16 @@ preprocess_abnb <- function(dat) {
     # drop pure identifiers, cast types
     select(-ID, -host_id, -host_name) %>%
     mutate(
-      last_review   = as.numeric(ymd(last_review)),
-      neighbourhood = as.factor(neighbourhood)
-    )
-
-  dat <- dat %>% mutate(reviews_per_month = replace_na(reviews_per_month, 0))
-
+      neighbourhood = as.factor(neighbourhood),
+      last_review = ymd(last_review),
+      last_review = coalesce(last_review, as.Date("2010-01-01")),
+      last_review = as.numeric(last_review),
+      distance_from_center = distHaversine(dat[, c("longitude", "latitude")], chicago_center) / 1000,
+      is_downtown = if_else(neighbourhood %in% c("Loop", "Lower West Side", "Near West Side", "Near North Side", "Near South Side"),
+      1, 0  ), 
+      reviews_per_month = tidyr::replace_na(reviews_per_month, 0)
+  )
+    
   dat <- dat %>%
     mutate(availability_365_rate = (365 - availability_365) / 365) %>%
     select(-availability_365)
@@ -968,7 +1209,6 @@ test_ids <- df_test$ID
 
 df_test_proc <- preprocess_abnb(df_test)
 
-
 final_rec <- recipe(price ~ ., data = df_train) %>%
 step_zv(all_predictors()) %>%
 step_impute_median(all_numeric_predictors()) %>%
@@ -976,25 +1216,24 @@ step_other(all_nominal_predictors(), threshold = 0.01) %>%
 step_novel(all_nominal_predictors()) %>%
 step_dummy(all_nominal_predictors())
 
-
 p_final      <- ncol(dplyr::select(df_train, -price))
 mtry_chosen  <- min(47L, p_final)  
 
 final_spec <- boost_tree(
 mode           = "regression",
-trees          = 750L,
-learn_rate     = 0.10,
+trees          = 1200L,
+learn_rate     = 0.01,
 tree_depth     = 6L,
-min_n          = 12L,
-loss_reduction = 0.4311075,  # gamma
-sample_size    = 0.5,
+min_n          = 10L,
+loss_reduction = 0.0245,  # gamma
+sample_size    = 0.9,
 mtry           = mtry_chosen
 ) %>%
 set_engine(
 "xgboost",
 eval_metric = "rmse",
-lambda      = 1.0,
-alpha       = 0.0,
+lambda      = 9.4e-6,
+alpha       = 1.7e-8,
 nthread     = max(1, parallel::detectCores() - 1)
 )
 
@@ -1004,7 +1243,6 @@ add_model(final_spec)
 
 final_fit <- fit(final_wf, data = df_train)
 
-
 test_preds <- predict(final_fit, new_data = df_test_proc) %>%
 dplyr::rename(price = .pred) %>%
 dplyr::mutate(price = pmax(price, 0)) 
@@ -1013,7 +1251,6 @@ submission <- tibble::tibble(
 ID    = test_ids,
 price = test_preds$price
 )
-
 
 readr::write_csv(submission, "predictions_submission.csv")
 
@@ -1035,9 +1272,8 @@ train_preds_split <- predict(model_train_only, new_data = train_prep) %>% pull(.
 val_preds_split   <- predict(model_train_only, new_data = val_prep)   %>% pull(.pred)
 
 train_rmse_split <- rmse_vec(truth = train_prep$price, estimate = train_preds_split)
-val_rmse_split   <- rmse_vec(truth = val_prep$price,   estimate = val_preds_split)
+val_rmse_split   <- rmse_vec(truth = val_prep$price, estimate = val_preds_split)
 
 cat(sprintf("Train RMSE (split model): %.4f\n", train_rmse_split))
 cat(sprintf("Validation RMSE: %.4f\n", val_rmse_split))
-
 ```
